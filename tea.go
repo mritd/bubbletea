@@ -13,10 +13,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"runtime/debug"
 	"sync"
+	"syscall"
 
-	isatty "github.com/mattn/go-isatty"
+	"github.com/mattn/go-isatty"
 	te "github.com/muesli/termenv"
 	"golang.org/x/crypto/ssh/terminal"
 )
@@ -58,6 +60,38 @@ func Batch(cmds ...Cmd) Cmd {
 		return batchMsg(cmds)
 	}
 }
+
+// Quit is a special command that tells the Bubble Tea program to exit.
+func Quit() Msg {
+	return quitMsg{}
+}
+
+// quitMsg in an internal message signals that the program should quit. You can
+// send a quitMsg with Quit.
+type quitMsg struct{}
+
+// batchMsg is the internal message used to perform a bunch of commands. You
+// can send a batchMsg with Batch.
+type batchMsg []Cmd
+
+// WindowSizeMsg is used to report on the terminal size. It's sent to Update
+// once initially and then on every terminal resize.
+type WindowSizeMsg struct {
+	Width  int
+	Height int
+}
+
+// HideCursor is a special command for manually instructing Bubble Tea to hide
+// the cursor. In some rare cases, certain operations will cause the terminal
+// to show the cursor, which is normally hidden for the duration of a Bubble
+// Tea program's lifetime. You most likely will not need to use this command.
+func HideCursor() Msg {
+	return hideCursorMsg{}
+}
+
+// hideCursorMsg is an internal command used to hide the cursor. You can send
+// this message with HideCursor.
+type hideCursorMsg struct{}
 
 // ProgramOption is used to set options when intializing a Program. Program can
 // accept a variable number of options.
@@ -109,39 +143,10 @@ type Program struct {
 	// from panics, print the stack trace, and disable raw mode. This feature
 	// is on by default.
 	CatchPanics bool
+
+	inputIsTTY  bool
+	outputIsTTY bool
 }
-
-// Quit is a special command that tells the Bubble Tea program to exit.
-func Quit() Msg {
-	return quitMsg{}
-}
-
-// quitMsg in an internal message signals that the program should quit. You can
-// send a quitMsg with Quit.
-type quitMsg struct{}
-
-// batchMsg is the internal message used to perform a bunch of commands. You
-// can send a batchMsg with Batch.
-type batchMsg []Cmd
-
-// WindowSizeMsg is used to report on the terminal size. It's sent to Update
-// once initially and then on every terminal resize.
-type WindowSizeMsg struct {
-	Width  int
-	Height int
-}
-
-// HideCursor is a special command for manually instructing Bubble Tea to hide
-// the cursor. In some rare cases, certain operations will cause the terminal
-// to show the cursor, which is normally hidden for the duration of a Bubble
-// Tea program's lifetime. You most likely will not need to use this command.
-func HideCursor() Msg {
-	return hideCursorMsg{}
-}
-
-// hideCursorMsg is an internal command used to hide the cursor. You can send
-// this message with HideCursor.
-type hideCursorMsg struct{}
 
 // NewProgram creates a new Program.
 func NewProgram(model Model, opts ...ProgramOption) *Program {
@@ -167,15 +172,19 @@ func (p *Program) Start() error {
 		msgs = make(chan Msg)
 		errs = make(chan error)
 		done = make(chan struct{})
+
+		outputAsFile *os.File
 	)
 
-	// Is output a file?
-	outputAsFile, outputIsFile := p.output.(*os.File)
+	// Is output a terminal?
+	if f, ok := p.output.(*os.File); ok {
+		outputAsFile = f
+		p.outputIsTTY = isatty.IsTerminal(f.Fd())
+	}
 
-	// Is output a TTY?
-	var isTTY bool
-	if outputIsFile {
-		isTTY = isatty.IsTerminal(outputAsFile.Fd())
+	// Is input a terminal?
+	if f, ok := p.input.(*os.File); ok {
+		p.inputIsTTY = isatty.IsTerminal(f.Fd())
 	}
 
 	if p.CatchPanics {
@@ -191,15 +200,13 @@ func (p *Program) Start() error {
 
 	p.renderer = newRenderer(p.output, &p.mtx)
 
-	// Check if output is a TTY before entering raw mode, hiding the cursor and
-	// so on.
-	if isTTY {
-		err := initTerminal(p.output)
-		if err != nil {
-			return err
-		}
-		defer restoreTerminal(p.output)
+	// Entering raw, mode, hiding the cursor and so on. Parts of this will be
+	// skipped over if input or output is not a TTY.
+	err := p.initTerminal()
+	if err != nil {
+		return err
 	}
+	defer p.restoreTerminal()
 
 	// Initialize program
 	model := p.initialModel
@@ -220,6 +227,19 @@ func (p *Program) Start() error {
 	// Subscribe to user input
 	if p.input != nil {
 		go func() {
+
+			// If input is not a TTY listen for SIGINT
+			if !p.inputIsTTY {
+				go func() {
+					sig := make(chan os.Signal, 1)
+					signal.Notify(sig, syscall.SIGINT)
+					defer signal.Stop(sig)
+					<-sig
+					msgs <- quitMsg{}
+				}()
+				return
+			}
+
 			for {
 				msg, err := readInput(p.input)
 				if err != nil {
@@ -234,7 +254,7 @@ func (p *Program) Start() error {
 		}()
 	}
 
-	if isTTY {
+	if p.outputIsTTY {
 		// Get initial terminal size
 		go func() {
 			w, h, err := terminal.GetSize(int(outputAsFile.Fd()))
